@@ -1,0 +1,34 @@
+# =================
+# Archivos de Entorno (¡MUY IMPORTANTE!)
+# =================
+# Ignora cualquier archivo .env para proteger tus claves privadas y de API.
+.env*
+
+
+# =================
+# Dependencias y Compilación de Rust
+# =================
+# El directorio `target` contiene todos los archivos compilados. Es pesado y específico de tu máquina.
+# Siempre debe ser ignorado.
+/target/
+
+# `Cargo.lock` asegura que todos los desarrolladores usen las mismas versiones de las dependencias.
+# Para una aplicación (como este bot), es BUENA PRÁCTICA subirlo. No lo ignoraremos.
+
+
+# =================
+# Archivos Generados por el Bot
+# =================
+# El caché de pools que creamos para acelerar el arranque.
+src/.cached-pools.csv
+
+# Cualquier archivo de log que el bot pueda generar.
+*.log
+
+
+# =================
+# Archivos de Editor de Código y Sistema Operativo
+# =================
+.vscode/
+.idea/
+.DS_Store
