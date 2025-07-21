@@ -1,33 +1,40 @@
-// src/provider.rs
-
-use ethers::prelude::*;
-use std::str::FromStr;
-use std::sync::Arc;
-
 use crate::config::CONFIG;
+use anyhow::{Result, Error};
+use ethers::{
+    prelude::*,
+    providers::{Http, Provider},
+};
+use std::{sync::Arc, time::Duration};
 
-abigen!(
-    AggregatorV3Interface,
-    r#"[
-        function latestRoundData() external view returns (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound)
-        function decimals() external view returns (uint8)
-    ]"#
-);
+/// Establece la conexión principal con el proveedor RPC (HTTP).
+/// Esta conexión se usará para todas las consultas on-chain y el envío de transacciones.
+pub fn connect_provider() -> Result<Arc<Provider<Http>>> {
+    // Intenta crear un proveedor desde la URL en la configuración.
+    // El `.interval()` establece la frecuencia con la que `ethers-rs` consulta al nodo,
+    // lo que ayuda a evitar ser rate-limited. 500ms es un valor razonable.
+    let provider = Provider::<Http>::try_from(CONFIG.https_url.as_str())?
+        .interval(Duration::from_millis(500));
 
-pub async fn get_eth_price() -> f64 {
-    let provider = Provider::<Http>::try_from(CONFIG.https_url.clone()).expect("Failed to connect to provider");
-    let client = Arc::new(provider);
-    
-    // Dirección del Price Feed de ETH/USD de Chainlink en Mainnet
-    let feed_address: H160 = "0x5f4eC3Df9cbd43714FE2740f5E3616155c5b8419".parse().unwrap();
-    let contract = AggregatorV3Interface::new(feed_address, client);
+    // Envolvemos el proveedor en un Arc (Atomic Reference Counting) para poder
+    // compartirlo de forma segura y eficiente entre todas las tareas asíncronas del bot.
+    Ok(Arc::new(provider))
+}
 
-    if let Ok((_, price, _, _, _)) = contract.latest_round_data().call().await {
-        let decimals = contract.decimals().call().await.unwrap_or(8) as u32;
-        let price_dec = (price.as_u128() as f64) / 10f64.powi(decimals as i32);
-        return price_dec;
+/// Estima el gas para una llamada de contrato con una lógica de reintentos y un margen de seguridad.
+pub async fn estimate_gas<M: Middleware>(
+    call: &ContractCall<M, ()>,
+) -> Result<U256> {
+    // Intenta estimar el gas hasta 3 veces con un pequeño delay entre intentos.
+    for attempt in 0..3 {
+        if let Ok(gas) = call.estimate_gas().await {
+            // Si la estimación tiene éxito, le añadimos un buffer del 25% por seguridad.
+            // Esto ayuda a prevenir que la transacción falle por cambios mínimos en el estado.
+            return Ok(gas * 125 / 100);
+        }
+        tokio::time::sleep(Duration::from_millis(50 * (attempt + 1))).await;
     }
-    
-    // Fallback por si Chainlink falla
-    0.0
+
+    // Si después de 3 intentos la estimación falla, usamos el valor de fallback
+    // definido en nuestra configuración. Es un valor alto para asegurar la ejecución.
+    Ok(U256::from(CONFIG.gas_limit))
 }
