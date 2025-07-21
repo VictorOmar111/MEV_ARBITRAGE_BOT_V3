@@ -1,129 +1,167 @@
-// src/strategy.rs
-
-use ethers::{prelude::*, types::{H160, U256}};
-use log::{info, warn};
-use std::{collections::HashMap, str::FromStr, sync::Arc, path::PathBuf};
-use tokio::sync::broadcast::Sender;
-
 use crate::{
     config::CONFIG,
-    constants::Env,
-    execution::execute_flashloan_transaction,
-    math::{calculate_net_profit, calculate_optimal_input},
-    paths::{generate_triangular_paths, ArbPath},
-    pools::{load_all_pools_v3, Pool},
+    constants::{PANCAKESWAP_V3_FACTORY, SUSHISWAP_V3_FACTORY, UNISWAP_V3_FACTORY},
+    execution,
+    optimization::{self, ArbitrageOpportunity, ROUTE_STATS},
+    oracle::{self, OracleMap},
+    paths::{self, generate_triangular_paths, ArbPath},
+    pools,
     streams::Event,
-    utils::get_touched_pool_reserves,
+    types::{DexVariant, Pool}, // Importación directa de Pool
 };
+use ethers::{prelude::*, types::U256};
+use futures_util::{stream::FuturesUnordered, StreamExt};
+use lazy_static::lazy_static;
+use log::{info, warn};
+use prometheus::{register_int_counter, register_int_gauge, IntCounter, IntGauge};
+use std::{collections::HashSet, sync::Arc};
+use tokio::sync::broadcast::Sender;
 
-#[derive(Clone, Debug)]
-pub struct DexConfig {
-    pub name: &'static str,
-    pub router_key_str: &'static str,
-    pub factory_address: H160,
-    pub factory_creation_block: u64,
+lazy_static! {
+    static ref ROUTES_EVALUATED: IntCounter = register_int_counter!("routes_evaluated_total", "Total de rutas evaluadas").unwrap();
+    static ref TRADES_EXECUTED: IntCounter = register_int_counter!("trades_executed_total", "Total de trades enviados").unwrap();
+    static ref TRADES_FAILED: IntCounter = register_int_counter!("trades_failed_total", "Total de trades que fallaron").unwrap();
+    static ref CURRENT_PATHS: IntGauge = register_int_gauge!("current_paths_available", "Rutas de arbitraje disponibles").unwrap();
 }
 
-#[derive(Clone, Debug)]
-pub struct ArbitrageOpportunity {
-    pub path: ArbPath,
-    pub dex_config: DexConfig,
-    pub optimal_amount_in: U256,
-    pub net_profit_usd: f64,
-    pub expected_output: U256,
-}
+const OPPORTUNITY_BUNDLE_SIZE: usize = 5;
+const ROUTE_FAILURE_COOLDOWN_BLOCKS: u64 = 10;
 
+// CORRECCIÓN FINAL: La firma ahora coincide perfectamente con el tipo de `client` creado en `lib.rs`
 pub async fn event_handler(
+    client: Arc<SignerMiddleware<Provider<Http>, LocalWallet>>,
     provider_ws: Arc<Provider<Ws>>,
+    oracle_map: Arc<OracleMap>,
     event_sender: Sender<Event>,
+    initial_pools: Vec<Pool>, // Usamos `Pool` directamente desde `types`
+    initial_paths: Vec<ArbPath>,
 ) -> anyhow::Result<()> {
-    let env = Env::new();
-    let http_provider = Arc::new(Provider::<Http>::try_from(env.https_url.clone())?);
 
-    let dex_configs = vec![
-        DexConfig {
-            name: "Uniswap V3",
-            router_key_str: "UniswapV3", // Debe coincidir con tu contrato
-            factory_address: H160::from_str("0x1F98431c8aD98523631AE4a59f267346ea31F984")?,
-            factory_creation_block: 420,
-        },
-        // Aquí puedes añadir otras fábricas V3 de Arbitrum
+    let _dex_factories = vec![
+        (*UNISWAP_V3_FACTORY, 420, DexVariant::UniswapV3),
+        (*SUSHISWAP_V3_FACTORY, 19620263, DexVariant::SushiV3),
+        (*PANCAKESWAP_V3_FACTORY, 61748453, DexVariant::PancakeV3),
     ];
 
-    info!("🤖 Monitoreando {} DEXs en Arbitrum.", dex_configs.len());
-    let dex_factories: Vec<(H160, u64)> = dex_configs.iter().map(|d| (d.factory_address, d.creation_block)).collect();
+    let mut pools = initial_pools;
+    let mut paths = initial_paths;
+    CURRENT_PATHS.set(paths.len() as i64);
 
-    let pools = load_all_pools_v3(
-        &env.wss_url,
-        &dex_factories,
-        PathBuf::from(&env.cache_path),
-        env.cache_ttl_secs,
-        env.checkpoint_path.as_deref(),
-    ).await?;
-
-    let token_in = H160::from_str(&env.token_in)?;
-    let paths = generate_triangular_paths(&pools, token_in);
-    info!("🏁 Rutas pre-generadas: {}", paths.len());
-
-    let mut reserves: HashMap<H160, crate::multi::Reserve> = HashMap::new(); // Asumiendo que `multi` tiene el struct Reserve
     let mut event_receiver = event_sender.subscribe();
-
-    info!("✅ Estrategia iniciada. Esperando nuevos bloques...");
+    let mut last_refresh_block = 0u64;
+    info!(" Estrategia lista con {} rutas. Esperando nuevos bloques...", paths.len());
 
     loop {
         if let Ok(Event::Block(block)) = event_receiver.recv().await {
-            info!("🔔 Nuevo Bloque #{}", block.block_number);
+            let block_number = block.number.unwrap_or_default().as_u64();
+            info!("--- Bloque Nuevo #{block_number} ---");
 
-            let touched = get_touched_pool_reserves(provider_ws.clone(), block.block_number).await.unwrap_or_default();
-            if touched.is_empty() {
-                info!("Sin actividad en pools relevantes.");
-                continue;
+            if last_refresh_block == 0
+                || block_number.saturating_sub(last_refresh_block)
+                    >= CONFIG.path_refresh_interval_blocks
+            {
+                info!(" Refrescando lista de pools y rutas...");
+                pools = pools::load_all_pools_v3(provider_ws.clone(), &oracle_map).await?;
+                paths = generate_triangular_paths(&pools, CONFIG.token_in_address, &oracle_map);
+                CURRENT_PATHS.set(paths.len() as i64);
+                last_refresh_block = block_number;
+                crate::clear_old_locks(block_number);
             }
-            reserves.extend(touched);
 
-            let mut best_opportunity: Option<ArbitrageOpportunity> = None;
+            let base_gas_price = block.base_fee_per_gas.unwrap_or_else(U256::zero);
+            let tasks = FuturesUnordered::new();
 
             for path in &paths {
-                if !path.pools().iter().all(|p| reserves.contains_key(p)) { continue; }
-
-                if let Some(optimal_amount) = calculate_optimal_input(path, &reserves) {
-                    if optimal_amount.is_zero() { continue; }
-
-                    let (net_profit, expected_out) = calculate_net_profit(http_provider.clone(), optimal_amount, path, &reserves).await;
-
-                    if net_profit <= CONFIG.get()?.min_profit_usd { continue; }
-
-                    if best_opportunity.as_ref().map_or(true, |best| net_profit > best.net_profit_usd) {
-                        info!("💡 Oportunidad mejorada: profit=${:.2}", net_profit);
-                        
-                        // --- LÓGICA CORREGIDA: Encuentra el DexConfig correcto usando el campo `factory` del pool ---
-                        let dex_config = dex_configs.iter()
-                            .find(|d| d.factory_address == path.pool_1.factory)
-                            .expect("Factory de la ruta no encontrada. Esto no debería pasar.")
-                            .clone();
-
-                        best_opportunity = Some(ArbitrageOpportunity {
-                            path: path.clone(),
-                            dex_config,
-                            optimal_amount_in: optimal_amount,
-                            net_profit_usd: net_profit,
-                            expected_output: expected_out,
-                        });
+                let is_in_cooldown = {
+                    let stats_map = ROUTE_STATS.lock().unwrap();
+                    if let Some(stats) = stats_map.get(&path.key()) {
+                        block_number < stats.last_failure_block + ROUTE_FAILURE_COOLDOWN_BLOCKS
+                    } else {
+                        false
                     }
+                };
+                if is_in_cooldown { continue; }
+
+                let mut p = path.clone();
+                let prov = Arc::new(client.provider().clone());
+                let omap = oracle_map.clone();
+                tasks.push(tokio::spawn(async move {
+                    ROUTES_EVALUATED.inc();
+                    let spot_price = p.get_spot_price(prov.clone()).await.ok()?;
+                    let oracle_info =
+                        oracle::get_max_profit_oracle(&p.token_a, spot_price, &omap, prov.clone())
+                            .await?;
+                    optimization::find_best_trade_golden_section(
+                        prov, &mut p, base_gas_price, oracle_info, &omap, block_number,
+                    ).await
+                }));
+            }
+
+            let mut profitable_opportunities: Vec<ArbitrageOpportunity> =
+                tasks.filter_map(|res| async { res.ok().flatten() }).collect().await;
+
+            if profitable_opportunities.is_empty() {
+                info!("No se encontraron oportunidades rentables en este bloque.");
+                continue;
+            }
+
+            profitable_opportunities.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+
+            let mut bundle_to_execute = Vec::new();
+            let mut used_pools = HashSet::new();
+
+            for opp in profitable_opportunities {
+                if bundle_to_execute.len() >= OPPORTUNITY_BUNDLE_SIZE { break; }
+
+                let p1 = opp.path.address(1);
+                let p2 = opp.path.address(2);
+                let p3 = opp.path.address(3);
+                if used_pools.contains(&p1) || used_pools.contains(&p2) || used_pools.contains(&p3) { continue; }
+
+                let mut final_opp = opp.clone();
+                final_opp.slippage_bps = calculate_dynamic_slippage(opp.tvl, opp.net_profit_usd);
+
+                if crate::lock_opportunity(block_number, &final_opp.path) {
+                    used_pools.insert(p1);
+                    used_pools.insert(p2);
+                    used_pools.insert(p3);
+                    bundle_to_execute.push(final_opp);
                 }
             }
-            
-            if let Some(winner) = best_opportunity {
-                info!(
-                    "🚀 Ejecutando arbitraje en {}! Profit: ${:.2}, In: {}",
-                    winner.dex_config.name, winner.net_profit_usd, winner.optimal_amount_in
-                );
-                if let Err(e) = execute_flashloan_transaction(&winner).await {
-                    warn!("❗ Error en ejecución de la transacción: {:?}", e);
+
+            if !bundle_to_execute.is_empty() {
+                let execution_results = execution::execute_arbitrage_bundle(
+                    client.clone(), bundle_to_execute, base_gas_price,
+                ).await;
+                for result in execution_results {
+                    match result {
+                        Ok((_tx_hash, path_key)) => {
+                            TRADES_EXECUTED.inc();
+                            let mut stats_map = ROUTE_STATS.lock().unwrap();
+                            let stats = stats_map.entry(path_key).or_default();
+                            stats.successes += 1;
+                        }
+                        Err((e, path_key)) => {
+                            TRADES_FAILED.inc();
+                            let mut stats_map = ROUTE_STATS.lock().unwrap();
+                            let stats = stats_map.entry(path_key.clone()).or_default();
+                            stats.failures += 1;
+                            stats.last_failure_block = block_number;
+                            warn!(" Falló TX del bundle para la ruta {path_key}: {e:?}");
+                        }
+                    }
                 }
             } else {
-                info!("No se encontraron oportunidades rentables en este bloque.");
+                info!("No se encontraron oportunidades no conflictivas para ejecutar.");
             }
         }
     }
+}
+
+fn calculate_dynamic_slippage(tvl: f64, net_profit_usd: f64) -> u32 {
+    if tvl > 5_000_000.0 {
+        if net_profit_usd < 100.0 { 8 } else if net_profit_usd < 1000.0 { 12 } else { 15 }
+    } else if tvl > 500_000.0 {
+        if net_profit_usd < 50.0 { 18 } else { 25 }
+    } else { 40 }
 }
