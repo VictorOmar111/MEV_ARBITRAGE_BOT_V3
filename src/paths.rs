@@ -1,121 +1,172 @@
-// src/paths.rs
+use crate::{
+    oracle::OracleMap,
+    simulator,
+    types::{Pool, DexVariant},
+};
+use anyhow::Result;
+use ethers::{
+    prelude::*,
+    types::{H160, U256},
+};
+use log::info;
+use std::{cmp::Ordering, collections::HashMap, sync::Arc, time::Instant};
 
-use ethers::providers::Middleware;
-use ethers::types::{H160, U256};
-use log::{info, warn};
-use std::collections::HashMap;
-use std::time::Instant;
+// --- Constantes de Filtrado del Pathfinder ---
+// Ignorar pools con menos de $50k de liquidez para evitar alto slippage.
+const MIN_TVL_USD: f64 = 50_000.0;
+// Limitar el número de pools por token para evitar una explosión combinatoria.
+const MAX_POOLS_PER_TOKEN: usize = 75;
 
-use crate::pools::{DexVariant, Pool};
-use crate::simulator::UniswapV3Simulator;
-
-/// Representa una ruta de arbitraje triangular completa a través de 3 pools de Uniswap V3.
+/// Representa una ruta de arbitraje triangular completa A -> B -> C -> A.
 #[derive(Debug, Clone)]
 pub struct ArbPath {
     pub pool_1: Pool,
     pub pool_2: Pool,
     pub pool_3: Pool,
-    pub token_a: H160, // Token de inicio y fin del ciclo
-    pub token_b: H160, // Token intermedio 1
-    pub token_c: H160, // Token intermedio 2
-    // Banderas para la dirección del swap en cada pool (true si es token0 -> token1)
-    pub zero_for_one_1: bool,
-    pub zero_for_one_2: bool,
-    pub zero_for_one_3: bool,
+    pub token_a: H160,
+    pub token_b: H160,
+    pub token_c: H160,
+    pub score: f64, // El score se calculará y asignará en el módulo de optimización.
 }
 
 impl ArbPath {
-    /// Simula la ejecución de los 3 swaps en cadena llamando al Uniswap V3 Quoter.
-    /// Devuelve la cantidad final del token de salida (`token_a`) si la simulación es exitosa.
-    pub async fn simulate_v3_path<M: Middleware>(
+    pub fn key(&self) -> String {
+        format!("{:?}-{:?}-{:?}", self.pool_1.address, self.pool_2.address, self.pool_3.address)
+    }
+    /// Simula un arbitraje a través de los 3 pools de la ruta.
+    /// Toma una cantidad de `token_a` y devuelve la cantidad final de `token_a`.
+    pub async fn simulate_v3_path<M: Middleware + 'static>(
         &self,
+        provider: Arc<M>,
         amount_in: U256,
-        provider: &M,
-        quoter: H160,
     ) -> Option<U256> {
-        let mut current_amount = amount_in;
-        let mut current_token_in = self.token_a;
+        // Salto 1: A -> B
+        let (token_in_1, token_out_1) = if self.pool_1.token0 == self.token_a {
+            (self.pool_1.token0, self.pool_1.token1)
+        } else {
+            (self.pool_1.token1, self.pool_1.token0)
+        };
+        let amount_out_1 = simulator::quote_exact_input_single(
+            provider.clone(), self.pool_1.version, token_in_1, token_out_1, self.pool_1.fee, amount_in,
+        ).await.ok()?;
 
-        // Iteramos a través de los 3 pasos del arbitraje
-        for (pool, token_out, _zero_for_one) in [
-            (&self.pool_1, self.token_b, self.zero_for_one_1),
-            (&self.pool_2, self.token_c, self.zero_for_one_2),
-            (&self.pool_3, self.token_a, self.zero_for_one_3),
-        ] {
-            let amount_out = UniswapV3Simulator::quote_exact_input_single(
-                provider,
-                quoter,
-                current_token_in,
-                token_out,
-                pool.fee.into(),
-                current_amount,
-            )
-            .await
-            .ok()?; // Si cualquier quote falla, la simulación entera falla.
+        if amount_out_1.is_zero() { return None; }
 
-            current_amount = amount_out;
-            current_token_in = token_out;
-        }
-        
-        Some(current_amount)
+        // Salto 2: B -> C
+        let (token_in_2, token_out_2) = if self.pool_2.token0 == self.token_b {
+            (self.pool_2.token0, self.pool_2.token1)
+        } else {
+            (self.pool_2.token1, self.pool_2.token0)
+        };
+        let amount_out_2 = simulator::quote_exact_input_single(
+            provider.clone(), self.pool_2.version, token_in_2, token_out_2, self.pool_2.fee, amount_out_1,
+        ).await.ok()?;
+
+        if amount_out_2.is_zero() { return None; }
+
+        // Salto 3: C -> A
+        let (token_in_3, token_out_3) = if self.pool_3.token0 == self.token_c {
+            (self.pool_3.token0, self.pool_3.token1)
+        } else {
+            (self.pool_3.token1, self.pool_3.token0)
+        };
+        let final_amount_out = simulator::quote_exact_input_single(
+            provider, self.pool_3.version, token_in_3, token_out_3, self.pool_3.fee, amount_out_2,
+        ).await.ok()?;
+
+        Some(final_amount_out)
     }
 
-    /// Construye el path de tokens (A → B → C → A) para ser usado en la transacción del smart contract.
-    pub fn get_swap_path(&self) -> Vec<H160> {
-        vec![self.token_a, self.token_b, self.token_c, self.token_a]
+    /// Obtiene el precio spot aproximado de la ruta simulando con 1 unidad del token de entrada.
+    pub async fn get_spot_price<M: Middleware + 'static>(&self, provider: Arc<M>) -> Result<f64> {
+        let input_decimals = self.get_input_decimals();
+        let one_token = U256::from(10).pow(U256::from(input_decimals));
+
+        let simulated_out = self.simulate_v3_path(provider, one_token).await.unwrap_or_default();
+
+        Ok(simulated_out.as_u128() as f64 / 10f64.powi(input_decimals as i32))
+    }
+
+    /// Devuelve los decimales del token de entrada (token_a) de la ruta.
+    pub fn get_input_decimals(&self) -> u8 {
+        if self.pool_1.token0 == self.token_a {
+            self.pool_1.decimals0
+        } else {
+            self.pool_1.decimals1
+        }
+    }
+
+    // Funciones de conveniencia para acceder a datos anidados.
+    pub fn address(&self, index: usize) -> H160 {
+        match index {
+            1 => self.pool_1.address,
+            2 => self.pool_2.address,
+            3 => self.pool_3.address,
+            _ => H160::zero(),
+        }
     }
 }
 
-/// Genera todas las rutas de arbitraje triangular únicas usando exclusivamente pools V3 con 0.01% de fee.
-pub fn generate_triangular_paths(pools: &[Pool], token_in: H160) -> Vec<ArbPath> {
-    info!("🔍 Generando rutas triangulares V3 0.01%...");
+/// Genera todas las rutas de arbitraje triangular (A->B->C->A) a partir de una lista de pools.
+pub fn generate_triangular_paths(
+    pools: &[Pool],
+    token_in: H160,
+    oracle_map: &OracleMap,
+) -> Vec<ArbPath> {
     let start_time = Instant::now();
+    info!(" Generando rutas triangulares (TVL >= ${}, top {} pools/token)...", MIN_TVL_USD, MAX_POOLS_PER_TOKEN);
 
-    // Filtra primero para trabajar solo con el universo de pools que nos interesa.
-    let pools_v3_001: Vec<&Pool> = pools
-        .iter()
-        .filter(|p| p.version == DexVariant::UniswapV3 && p.fee == 100)
-        .collect();
-    
-    info!("Encontrados {} pools de Uniswap V3 con 0.01% de fee.", pools_v3_001.len());
+    // 1. Filtrar pools por TVL mínimo.
+    let filtered_pools: Vec<&Pool> = pools.iter().filter(|p| p.tvl_usd >= MIN_TVL_USD).collect();
 
+    // 2. Agrupar pools por cada token que contienen.
     let mut pools_by_token: HashMap<H160, Vec<&Pool>> = HashMap::new();
-    for p in &pools_v3_001 {
-        pools_by_token.entry(p.token0).or_default().push(p);
-        pools_by_token.entry(p.token1).or_default().push(p);
+    for pool in &filtered_pools {
+        pools_by_token.entry(pool.token0).or_default().push(pool);
+        pools_by_token.entry(pool.token1).or_default().push(pool);
     }
 
-    let mut paths = Vec::new();
+    // 3. Para cada token, mantener solo los N pools más líquidos para optimizar.
+    for list in pools_by_token.values_mut() {
+        list.sort_unstable_by(|a, b| b.tvl_usd.partial_cmp(&a.tvl_usd).unwrap_or(Ordering::Equal));
+        list.truncate(MAX_POOLS_PER_TOKEN);
+    }
 
-    if let Some(first_pools) = pools_by_token.get(&token_in) {
-        for &pool_ab in first_pools {
+    let mut valid_paths = Vec::new();
+    // 4. Construir las rutas A -> B -> C -> A.
+    if let Some(first_hop_pools) = pools_by_token.get(&token_in) {
+        for &pool_ab in first_hop_pools {
             let token_b = if pool_ab.token0 == token_in { pool_ab.token1 } else { pool_ab.token0 };
 
-            if let Some(second_pools) = pools_by_token.get(&token_b) {
-                for &pool_bc in second_pools {
-                    if pool_bc.address == pool_ab.address { continue; }
-                    
-                    let token_c = if pool_bc.token0 == token_b { pool_bc.token1 } else { pool_bc.token0 };
-                    if token_c == token_in || token_c == token_b { continue; }
+            // Filtro inteligente: no continuar si el token intermedio no tiene oráculo.
+            if oracle_map.get_feeds(&token_b).is_none() { continue; }
 
-                    if let Some(third_pools) = pools_by_token.get(&token_c) {
-                        for &pool_ca in third_pools {
+            if let Some(second_hop_pools) = pools_by_token.get(&token_b) {
+                for &pool_bc in second_hop_pools {
+                    if pool_bc.address == pool_ab.address { continue; } // Evitar usar el mismo pool dos veces.
+
+                    let token_c = if pool_bc.token0 == token_b { pool_bc.token1 } else { pool_bc.token0 };
+
+                    if token_c == token_in { continue; } // Evitar rutas A->B->A
+                    if oracle_map.get_feeds(&token_c).is_none() { continue; }
+
+                    if let Some(third_hop_pools) = pools_by_token.get(&token_c) {
+                        for &pool_ca in third_hop_pools {
                             if pool_ca.address == pool_ab.address || pool_ca.address == pool_bc.address { continue; }
-                            
-                            let closes_loop = (pool_ca.token0 == token_c && pool_ca.token1 == token_in) || 
-                                              (pool_ca.token1 == token_c && pool_ca.token0 == token_in);
+
+                            // Verificar que el tercer pool cierra el ciclo de vuelta a token_in.
+                            let closes_loop = (pool_ca.token0 == token_c && pool_ca.token1 == token_in)
+                                || (pool_ca.token1 == token_c && pool_ca.token0 == token_in);
 
                             if closes_loop {
-                                paths.push(ArbPath {
+                                valid_paths.push(ArbPath {
                                     pool_1: (*pool_ab).clone(),
                                     pool_2: (*pool_bc).clone(),
                                     pool_3: (*pool_ca).clone(),
                                     token_a: token_in,
                                     token_b,
                                     token_c,
-                                    zero_for_one_1: pool_ab.token0 == token_in,
-                                    zero_for_one_2: pool_bc.token0 == token_b,
-                                    zero_for_one_3: pool_ca.token0 == token_c,
+                                    score: 0.0,
                                 });
                             }
                         }
@@ -125,13 +176,6 @@ pub fn generate_triangular_paths(pools: &[Pool], token_in: H160) -> Vec<ArbPath>
         }
     }
 
-    let elapsed_secs = start_time.elapsed().as_secs_f64();
-    info!(
-        "➡️ Generadas {} rutas en {:.2}s → {:.2} rutas/s",
-        paths.len(),
-        elapsed_secs,
-        paths.len() as f64 / elapsed_secs
-    );
-
-    paths
+    info!(" Rutas generadas: {} en {:.2}s", valid_paths.len(), start_time.elapsed().as_secs_f64());
+    valid_paths
 }
