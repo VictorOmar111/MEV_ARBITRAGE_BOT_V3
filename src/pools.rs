@@ -1,123 +1,110 @@
-// src/pools.rs
-
-use anyhow::Result;
-use cfmms::{
-    dex::{Dex, DexVariant as CfmmsDexVariant},
-    pool::Pool as CfmmsPool,
-    sync::sync_pairs,
+use crate::{
+    config::CONFIG,
+    constants::USDC_ADDRESS,
+    multi::batch_get_pool_data,
+    oracle::OracleMap,
+    types::{DexVariant, Pool},
 };
-use csv::StringRecord;
-use ethers::providers::{Provider, Ws};
-use ethers::types::H160;
-use log::info;
+use anyhow::{anyhow, Result};
+use ethers::{prelude::*, types::H160};
+use log::{info, warn};
+use rust_decimal::{prelude::FromPrimitive, prelude::ToPrimitive, Decimal};
+use serde::Deserialize;
 use std::{
-    cmp::Ordering,
-    collections::HashSet,
-    fs,
-    hash::{Hash, Hasher},
+    collections::{HashMap, HashSet},
+    fs::{self, File},
     path::PathBuf,
-    str::FromStr,
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::SystemTime,
+    str::FromStr,
 };
 
-#[derive(Debug, Clone, Copy, Eq)]
-pub enum DexVariant { UniswapV3 }
+#[derive(Deserialize, Debug)]
+#[allow(non_snake_case)]
+struct GraphData { p100: Vec<GraphPool>, p500: Vec<GraphPool>, p3000: Vec<GraphPool>, p10000: Vec<GraphPool> }
+#[derive(Deserialize, Debug, Clone)]
+struct GraphPool { id: H160, #[serde(rename = "feeTier")] fee_tier: String, token0: GraphToken, token1: GraphToken }
+#[derive(Deserialize, Debug, Clone)]
+struct GraphToken { id: H160, decimals: String }
+#[derive(Deserialize, Debug)]
+struct GraphResponse { data: Option<GraphData> }
 
-// ... (Implementaciones de traits para DexVariant sin cambios) ...
-
-#[derive(Debug, Clone, Copy, Eq)]
-pub struct Pool {
-    pub factory: H160, // <-- CAMBIO IMPORTANTE: Guardamos la factory
-    pub address: H160,
-    pub version: DexVariant,
-    pub token0: H160,
-    pub token1: H160,
-    pub decimals0: u8,
-    pub decimals1: u8,
-    pub fee: u32,
-}
-
-// ... (Implementaciones de traits para Pool sin cambios) ...
-
-impl From<StringRecord> for Pool {
-    fn from(record: StringRecord) -> Self {
-        // ... (lógica de parseo robusta sin cambios) ...
-        // Añadimos la factory al parseo desde el caché
-        Self {
-            factory: H160::from_str(record.get(7).unwrap_or("")).unwrap_or_default(),
-            address: H160::from_str(record.get(0).unwrap_or("")).unwrap_or_default(),
-            // ... resto de los campos
-        }
-    }
-}
-
-impl Pool {
-    pub fn cache_row(&self) -> (String, i32, String, String, u8, u8, u32, String) {
-        (
-            format!("{:?}", self.address),
-            3,
-            format!("{:?}", self.token0),
-            format!("{:?}", self.token1),
-            self.decimals0,
-            self.decimals1,
-            self.fee,
-            format!("{:?}", self.factory), // Guardamos la factory en el caché
-        )
-    }
-}
-
+/// Carga los pools directamente desde el archivo de caché y los enriquece con datos en tiempo real.
 pub async fn load_all_pools_v3(
-    wss_url: &str,
-    factories: &[(H160, u64)], // Recibimos una referencia
-    cache_path: PathBuf,
-    max_cache_age_secs: u64,
+    provider: Arc<Provider<Ws>>,
+    oracle_map: &Arc<OracleMap>,
 ) -> Result<Vec<Pool>> {
-    if let Ok(metadata) = fs::metadata(&cache_path) {
-        if let Ok(modified) = metadata.modified() {
-            let age = SystemTime::now().duration_since(modified)?.as_secs();
-            if age <= max_cache_age_secs {
-                info!("📥 Usando caché de pools (edad: {} segundos)", age);
-                let mut reader = csv::Reader::from_path(&cache_path)?;
-                return Ok(reader.records().filter_map(|r| r.ok()).map(Pool::from).collect());
+    let cache_path = PathBuf::from(&CONFIG.cache_path);
+    info!(" Cargando mapa de pools pre-descubiertos desde {:?}...", cache_path);
+
+    let file = File::open(&cache_path)
+        .map_err(|_| anyhow!("FATAL: No se encontró el archivo de caché 'cache/pools_v4.csv'. Por favor, créalo primero con el script de Python."))?;
+
+    let mut rdr = csv::Reader::from_reader(file);
+    let mut pools: Vec<Pool> = rdr.deserialize().filter_map(Result::ok).collect();
+
+    if pools.is_empty() {
+        return Err(anyhow!("FATAL: La caché de pools está vacía. El bot no puede operar."));
+    }
+
+    info!("Cargados {} pools desde la caché. Enriqueciendo con datos en tiempo real...", pools.len());
+
+    let pool_addresses: Vec<H160> = pools.iter().map(|p| p.address).collect();
+    let raw_data = batch_get_pool_data(provider.clone(), &pool_addresses).await?;
+    info!("Datos en lote (liquidez/balances) obtenidos para {} pools.", raw_data.len());
+
+    let mut unique_tokens = HashSet::new();
+    for data in raw_data.values() {
+        unique_tokens.insert(data.token0);
+        unique_tokens.insert(data.token1);
+    }
+
+    let mut price_map = HashMap::new();
+    let known_tokens = [ *USDC_ADDRESS, crate::constants::WETH_ADDRESS.clone() ];
+    for &token in &known_tokens {
+        if let Some(price_info) = oracle_map.get_price::<Provider<Ws>>(&token, provider.clone()).await {
+            price_map.insert(token, price_info.price);
+        }
+    }
+    price_map.insert(*USDC_ADDRESS, 1.0);
+
+    for data in raw_data.values() {
+        let (t0, t1) = (data.token0, data.token1);
+        let (p0_known, p1_known) = (price_map.contains_key(&t0), price_map.contains_key(&t1));
+
+        if p0_known && !p1_known {
+            if let Ok(sqrt_price_x96) = Decimal::from_str(&data.sqrt_price_x96.to_string()) {
+                let price0 = *price_map.get(&t0).unwrap();
+                let price_t1_t0 = (sqrt_price_x96 / Decimal::from_u128(2u128.pow(96)).unwrap()).powi(2);
+                let price_t0_t1 = Decimal::ONE / price_t1_t0;
+                let price1 = price0 * (price_t0_t1.to_f64().unwrap_or(0.0) * 10f64.powi((data.decimals0 as i32) - (data.decimals1 as i32)));
+                if price1 > 0.0 { price_map.insert(t1, price1); }
+            }
+        } else if !p0_known && p1_known {
+            if let Ok(sqrt_price_x96) = Decimal::from_str(&data.sqrt_price_x96.to_string()) {
+                let price1 = *price_map.get(&t1).unwrap();
+                let price_t1_t0 = (sqrt_price_x96 / Decimal::from_u128(2u128.pow(96)).unwrap()).powi(2);
+                let price0 = price1 * (price_t1_t0.to_f64().unwrap_or(0.0) * 10f64.powi((data.decimals1 as i32) - (data.decimals0 as i32)));
+                if price0 > 0.0 { price_map.insert(t0, price0); }
             }
         }
     }
+    info!("Mapa de precios expandido a {} tokens por derivación.", price_map.len());
 
-    info!("💽 Sincronizando pools de Uniswap V3 desde la blockchain...");
-    let provider = Arc::new(Provider::<Ws>::connect(wss_url).await?);
-    let mut all_pools = HashSet::new();
+    for pool in &mut pools {
+        if let Some(data) = raw_data.get(&pool.address) {
+            let price0 = price_map.get(&data.token0).cloned().unwrap_or(0.0);
+            let price1 = price_map.get(&data.token1).cloned().unwrap_or(0.0);
+            if price0 == 0.0 || price1 == 0.0 { pool.tvl_usd = 0.0; continue; }
 
-    // Iteramos por cada factory para saber de dónde viene cada pool
-    for &(factory_address, creation_block) in factories {
-        info!("Sincronizando factory: {:?}", factory_address);
-        let dex = Dex::new(factory_address, CfmmsDexVariant::UniswapV3, creation_block, None);
-        let synced_pools: Vec<CfmmsPool> = sync_pairs(vec![dex], provider.clone(), None).await?;
-        
-        for p in synced_pools {
-            if let CfmmsPool::UniswapV3(pv3) = p {
-                all_pools.insert(Pool {
-                    factory: factory_address, // <-- ASIGNACIÓN CLAVE
-                    address: pv3.address,
-                    version: DexVariant::UniswapV3,
-                    token0: pv3.token_a,
-                    token1: pv3.token_b,
-                    decimals0: pv3.token_a_decimals,
-                    decimals1: pv3.token_b_decimals,
-                    fee: pv3.fee,
-                });
-            }
+            let balance0_dec = Decimal::from_u128(data.balance0.as_u128()).unwrap_or_default() / Decimal::from(10u128.pow(data.decimals0 as u32));
+            let balance1_dec = Decimal::from_u128(data.balance1.as_u128()).unwrap_or_default() / Decimal::from(10u128.pow(data.decimals1 as u32));
+            pool.tvl_usd = (Decimal::from_f64(price0).unwrap_or_default() * balance0_dec + Decimal::from_f64(price1).unwrap_or_default() * balance1_dec).to_f64().unwrap_or(0.0);
         }
     }
-    
-    let pools_vec = all_pools.into_iter().collect::<Vec<_>>();
-    info!("Total de pools V3 sincronizadas: {}", pools_vec.len());
 
-    let mut writer = csv::Writer::from_path(&cache_path)?;
-    writer.write_record(&["address", "version", "token0", "token1", "decimals0", "decimals1", "fee", "factory"])?;
-    for p in &pools_vec { writer.serialize(p.cache_row())?; }
-    writer.flush()?;
-    info!("🔒 Pools guardadas en caché en {:?}", cache_path);
+    let final_pools: Vec<Pool> = pools.into_iter().filter(|p| p.tvl_usd > 10_000_000.0).collect();
+    info!("Total de pools con TVL > $10M listos para operar: {}", final_pools.len());
 
-    Ok(pools_vec)
+    Ok(final_pools)
 }
