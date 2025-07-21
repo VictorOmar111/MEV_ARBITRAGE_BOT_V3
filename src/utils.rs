@@ -1,79 +1,39 @@
-// src/utils.rs
-
 use anyhow::Result;
 use chrono::Local;
-use ethers::{
-    providers::{Http, Middleware, Provider},
-    types::{BlockId, H160, U256, U64},
-};
 use fern::colors::{Color, ColoredLevelConfig};
 use log::LevelFilter;
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 
-use crate::multi::{batch_get_uniswap_v2_reserves, Reserve};
-
-/// Configura un logger simple y colorido para la terminal.
+/// Configura el logger global para la aplicación.
+/// Esto nos permite ver los logs (info, warn, error) en la consola de una manera
+/// legible y con colores para diferenciar la severidad de los mensajes.
 pub fn setup_logger() -> Result<()> {
+    // Configuración de colores para los diferentes niveles de log.
     let colors = ColoredLevelConfig::new()
         .info(Color::Green)
         .warn(Color::Yellow)
         .error(Color::Red)
-        .debug(Color::White)
-        .trace(Color::BrightBlack);
+        .debug(Color::White);
 
+    // Creación y aplicación del despachador de logs.
     fern::Dispatch::new()
+        // Formato de cada línea de log. Incluye timestamp, nivel coloreado y el mensaje.
         .format(move |out, message, record| {
             out.finish(format_args!(
-                "[{time}][{level}] {message}",
-                time = Local::now().format("%H:%M:%S"),
-                level = colors.color(record.level()),
-                message = message,
-            ));
+                "{}[{}] {}",
+                Local::now().format("[%H:%M:%S]"), // Timestamp ej: [14:35:10]
+                colors.color(record.level()),      // Nivel ej: [INFO]
+                message                            // El mensaje del log
+            ))
         })
+        // Nivel de log por defecto para nuestro bot. Veremos INFO y superiores.
         .level(LevelFilter::Info)
+        // Reducimos el ruido de las librerías externas como ethers y hyper.
+        .level_for("ethers", LevelFilter::Warn)
+        .level_for("hyper", LevelFilter::Warn)
+        // Enviamos el output a la salida estándar (la consola).
         .chain(std::io::stdout())
+        // Aplicamos la configuración.
         .apply()?;
 
     Ok(())
-}
-
-/// Calcula el `base_fee` del siguiente bloque según las reglas de EIP-1559.
-pub fn calculate_next_block_base_fee(
-    gas_used: U256,
-    gas_limit: U256,
-    base_fee: U256,
-) -> U256 {
-    let gas_target = gas_limit / 2;
-    if gas_used == gas_target {
-        return base_fee;
-    }
-    
-    let base_fee_delta = (base_fee * (gas_used - gas_target) / gas_target) / 8;
-    base_fee + base_fee_delta
-}
-
-
-pub async fn get_touched_pool_reserves(
-    provider: Arc<Provider<Http>>,
-    block_number: U64,
-) -> Result<HashMap<H160, Reserve>> {
-    let block = provider
-        .get_block_with_txs(BlockId::Number(block_number.into()))
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("Block not found: {}", block_number))?;
-
-    let mut touched_pools = HashSet::new();
-    for tx in block.transactions {
-        if let Some(to) = tx.to {
-            touched_pools.insert(to);
-        }
-    }
-
-    let pool_addresses: Vec<H160> = touched_pools.into_iter().collect();
-    if pool_addresses.is_empty() {
-        return Ok(HashMap::new());
-    }
-
-    batch_get_uniswap_v2_reserves(provider, pool_addresses).await
 }
