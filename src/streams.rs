@@ -1,65 +1,74 @@
-// src/streams.rs
-
-use anyhow::Result;
 use ethers::{
+    prelude::*,
     providers::{Middleware, Provider, Ws},
-    types::{Filter, Log, Transaction, U256, U64},
 };
-use tokio_stream::StreamExt;
+use futures_util::StreamExt;
 use log::{error, info, warn};
 use std::sync::Arc;
 use tokio::sync::broadcast::Sender;
-use tokio::time::{sleep, Duration};
 
-use crate::utils::calculate_next_block_base_fee;
-
+/// Define los eventos que el bot puede procesar.
+/// Por ahora, el principal es `Block`, que actúa como el "latido" del bot.
 #[derive(Clone, Debug)]
 pub enum Event {
-    Block(NewBlock),
-    PendingTx(Transaction),
-    Log(Log),
+    Block(Block<H256>),
+    MempoolTx(Transaction),
 }
 
-#[derive(Clone, Debug, Default)]
-pub struct NewBlock {
-    pub block_number: U64,
-    pub base_fee: U256,
-    pub next_base_fee: U256,
-}
+/// Escucha el stream de nuevos bloques de la red y emite un evento `Event::Block`
+/// para cada uno. Este es el disparador principal de nuestra estrategia.
+pub async fn stream_new_blocks(provider: Arc<Provider<Ws>>, sender: Sender<Event>) {
+    let mut stream = match provider.subscribe_blocks().await {
+        Ok(s) => s,
+        Err(e) => {
+            error!(" No se pudo suscribir a los bloques: {e:?}");
+            return;
+        }
+    };
+    info!(" Subscripción a nuevos bloques iniciada.");
 
-/// Escucha nuevos bloques de forma persistente con lógica de auto-reconexión.
-pub async fn stream_new_blocks(provider: Arc<Provider<Ws>>, event_sender: Sender<Event>) -> Result<()> {
-    loop {
-        info!("[STREAM] Conectando al stream de nuevos bloques...");
-        
-        match provider.subscribe_blocks().await {
-            Ok(stream) => {
-                info!("[STREAM] Conexión exitosa al stream de bloques. Escuchando...");
-                let mut stream = stream.filter_map(|block| match block.number {
-                    Some(number) => Some(NewBlock {
-                        block_number: number,
-                        base_fee: block.base_fee_per_gas.unwrap_or_default(),
-                        next_base_fee: calculate_next_block_base_fee(
-                            block.gas_used,
-                            block.gas_limit,
-                            block.base_fee_per_gas.unwrap_or_default(),
-                        ),
-                    }),
-                    None => None,
-                });
-
-                while let Some(block) = stream.next().await {
-                    if let Err(e) = event_sender.send(Event::Block(block)) {
-                        error!("[STREAM] Error enviando evento de nuevo bloque al canal: {}", e);
+    while let Some(block_header) = stream.next().await {
+        if let Some(hash) = block_header.hash {
+            // Obtenemos el bloque completo, ya que contiene información valiosa como el `base_fee_per_gas`.
+            match provider.get_block(hash).await {
+                Ok(Some(full_block)) => {
+                    if sender.send(Event::Block(full_block)).is_err() {
+                        // Esto ocurre si el receptor (el `strategy_handler`) ha terminado.
+                        // Podemos salir del bucle para no seguir trabajando inútilmente.
+                        warn!("El canal de eventos de bloques está cerrado. Terminando stream.");
+                        break;
                     }
                 }
-            }
-            Err(e) => {
-                error!("[STREAM] No se pudo suscribir al stream de bloques: {:?}", e);
+                Ok(None) => warn!("Reorganización de bloque detectada, el bloque {hash:?} ya no existe."),
+                Err(e) => error!("Error al obtener el bloque completo {hash:?}: {e:?}"),
             }
         }
-        
-        warn!("[STREAM] El stream de bloques ha terminado. Reconectando en 5 segundos...");
-        sleep(Duration::from_secs(5)).await;
+    }
+}
+
+/// (Opcional) Escucha el mempool para transacciones pendientes.
+/// Útil para estrategias de back-running. Puede ser intensivo en recursos.
+pub async fn stream_pending_txs(provider: Arc<Provider<Ws>>, sender: Sender<Event>) {
+    let mut stream = match provider.subscribe_pending_txs().await {
+        Ok(s) => s,
+        Err(e) => {
+            error!(" No se pudo suscribir al mempool: {e:?}");
+            return;
+        }
+    };
+    info!(" Subscripción al mempool iniciada.");
+
+    while let Some(tx_hash) = stream.next().await {
+        let provider_clone = provider.clone();
+        let sender_clone = sender.clone();
+        // Lanzamos una tarea separada para obtener los detalles de la TX.
+        // Esto evita que una llamada lenta a `get_transaction` bloquee todo el stream.
+        tokio::spawn(async move {
+            if let Ok(Some(tx)) = provider_clone.get_transaction(tx_hash).await {
+                if sender_clone.send(Event::MempoolTx(tx)).is_err() {
+                    // No logueamos como error, ya que el consumidor puede estar ocupado o cerrado.
+                }
+            }
+        });
     }
 }
