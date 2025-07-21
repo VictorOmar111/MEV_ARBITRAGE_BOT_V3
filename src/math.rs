@@ -1,126 +1,123 @@
-// src/math.rs
+use crate::execution;
+use futures::future::join_all;
+use crate::{
+    config::CONFIG,
+    oracle::OracleMap,
+    paths::ArbPath,
+    types::{OraclePriceInfo, Pool},
+    constants::WETH_ADDRESS,
+};
+use anyhow::{anyhow, Result};
+use ethers::{
+    prelude::*,
+    types::{H160, U256},
+};
+use lazy_static::lazy_static;
+use rust_decimal::{prelude::*, Decimal, MathematicalOps};
+use std::{
+    collections::{HashMap, VecDeque},
+    str::FromStr,
+    sync::{Arc, Mutex},
+};
 
-use ethers::contract::abigen;
-use ethers::middleware::Middleware;
-use ethers::providers::{Http, Provider};
-use ethers::types::{H160, U256};
-use once_cell::sync::Lazy;
-use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
-use rust_decimal::{Decimal, MathematicalOps};
-use rust_decimal_macros::dec;
-use std::collections::HashMap;
-use std::str::FromStr;
-use std::sync::{Arc, Mutex};
-
-use crate::config::CONFIG;
-use crate::multi::Reserve;
-use crate::paths::ArbPath;
-use crate::provider::get_eth_price;
-
-abigen!(
-    AggregatorV3Interface,
-    r#"[
-        function latestRoundData() view returns (uint80, int256, uint256, uint256, uint80)
-        function decimals() view returns (uint8)
-    ]"#
-);
-
-static DECIMALS_CACHE: Lazy<Mutex<HashMap<H160, u32>>> = Lazy::new(|| Mutex::new(HashMap::new()));
-const UNISWAP_V2_FEE: Decimal = dec!(0.997);
-
-pub fn u256_to_decimal(val: &U256, decimals: u32) -> Decimal {
-    Decimal::from_str(&val.to_string()).unwrap_or(Decimal::ZERO)
-        / Decimal::from(10u64.pow(decimals))
+#[derive(Debug, Default, Clone)]
+pub struct RouteHistory {
+    pub successes: u64,
+    pub failures: u64,
+    pub last_attempt_block: u64,
+    pub last_failure_block: u64,
 }
-
-pub async fn get_token_decimals(provider: Arc<Provider<Http>>, token: H160) -> u32 {
-    {
-        let cache = DECIMALS_CACHE.lock().unwrap();
-        if let Some(&dec) = cache.get(&token) { return dec; }
+impl RouteHistory {
+    pub fn winrate(&self) -> f64 {
+        let total = self.successes + self.failures;
+        if total == 0 { 0.5 } else { self.successes as f64 / total as f64 }
     }
-    abigen!(
-        ERC20,
-        r#"[
-            function decimals() view returns (uint8)
-        ]"#
-    );
-    let contract = ERC20::new(token, provider.clone());
-    let decimals = contract.decimals().call().await.unwrap_or(18u8) as u32;
-    DECIMALS_CACHE.lock().unwrap().insert(token, decimals);
-    decimals
+}
+lazy_static! {
+    pub static ref ROUTE_STATS: Mutex<HashMap<String, RouteHistory>> = Mutex::new(HashMap::new());
 }
 
-pub async fn calculate_optimal_input(
-    path: &ArbPath,
-    reserves: &HashMap<H160, Reserve>,
-) -> Result<Option<U256>, String> {
-    let reserve1 = reserves.get(&path.pool_1.address).ok_or("Reserve for pool_1 not found")?;
-    let reserve2 = reserves.get(&path.pool_2.address).ok_or("Reserve for pool_2 not found")?;
-    let reserve3 = reserves.get(&path.pool_3.address).ok_or("Reserve for pool_3 not found")?;
-
-    let (res_a_in, res_a_out) = if path.zero_for_one_1 { (reserve1.reserve0, reserve1.reserve1) } else { (reserve1.reserve1, reserve1.reserve0) };
-    let (res_b_in, res_b_out) = if path.zero_for_one_2 { (reserve2.reserve0, reserve2.reserve1) } else { (reserve2.reserve1, reserve2.reserve0) };
-    let (res_c_in, res_c_out) = if path.zero_for_one_3 { (reserve3.reserve0, reserve3.reserve1) } else { (reserve3.reserve1, reserve3.reserve0) };
-    
-    // Simulación simple para determinar si hay profit bruto.
-    // Una implementación completa usaría la fórmula analítica para el input óptimo.
-    let amount_in_sim = U256::exp10(18); // Simular con 1 token
-    if let Some(amount_out_sim) = path.simulate_v2_path(amount_in_sim, reserves) {
-        if amount_out_sim > amount_in_sim {
-            // Si hay profit, devolvemos un valor fijo como placeholder del óptimo.
-            // En una implementación real, aquí iría la fórmula matemática compleja.
-            return Ok(Some(amount_in_sim));
+pub fn u256_to_decimal(val: U256, decimals: u8) -> Result<Decimal> {
+    Decimal::from_str(&val.to_string())?.checked_div(Decimal::from(10u128.pow(decimals as u32))).ok_or_else(|| anyhow!("division por cero"))
+}
+pub fn decimal_to_u256(val: Decimal, decimals: u8) -> Result<U256> {
+    let scaled = val * Decimal::from(10u128.pow(decimals as u32));
+    U256::from_str(&scaled.round().to_string()).map_err(|e| anyhow!("error parseando U256: {e}"))
+}
+#[derive(Debug, Clone)]
+pub struct ArbitrageOpportunity {
+    pub path: ArbPath,
+    pub optimal_amount_in: U256,
+    pub expected_output: U256,
+    pub net_profit_usd: f64,
+    pub bribe_usd: f64,
+    pub lag: f64,
+    pub tvl: f64,
+    pub score: f64,
+    pub slippage_bps: u32,
+}
+async fn get_profit_for_amount<M: Middleware + 'static>(
+    provider: &Arc<M>, path: &ArbPath, amount_in: U256, base_gas_price_wei: U256, oracle_price_usd: f64, eth_price_usd: f64,
+) -> f64 {
+    if amount_in.is_zero() || oracle_price_usd <= 0.0 || eth_price_usd <= 0.0 { return -1.0; }
+    let gross_amount_out = match path.simulate_v3_path(provider.clone(), amount_in).await {
+        Some(out) if out > amount_in => out,
+        _ => return -1.0,
+    };
+    let gross_profit_u256 = gross_amount_out - amount_in;
+    let gross_profit_dec = u256_to_decimal(gross_profit_u256, path.get_input_decimals()).unwrap_or_default();
+    let gross_profit_usd = gross_profit_dec.to_f64().unwrap_or(0.0) * oracle_price_usd;
+    let bribe_usd = gross_profit_usd * CONFIG.max_bribe_percent;
+    let bribe_eth = bribe_usd / eth_price_usd;
+    let priority_fee_wei = decimal_to_u256(Decimal::from_f64(bribe_eth).unwrap_or_default(), 18).unwrap_or_default();
+    let total_gas_price = base_gas_price_wei + priority_fee_wei;
+    let gas_cost_eth = u256_to_decimal(total_gas_price * U256::from(CONFIG.gas_limit), 18).unwrap_or_default();
+    let gas_cost_usd = gas_cost_eth.to_f64().unwrap_or(0.0) * eth_price_usd;
+    gross_profit_usd - gas_cost_usd
+}
+pub async fn find_best_trade_golden_section<M: Middleware + 'static>(
+    provider: Arc<M>, path: &mut ArbPath, base_gas_price_wei: U256, oracle_info: OraclePriceInfo, oracle_map: &Arc<OracleMap>, current_block: u64,
+) -> Option<ArbitrageOpportunity> {
+    let (mut a, mut b, tol) = (U256::from(10).pow(17.into()), U256::from(10).pow(20.into()), U256::from(10).pow(15.into()));
+    let eth_price = oracle_map.get_price(&*WETH_ADDRESS, provider.clone()).await?.price;
+    let oracle_price = oracle_info.price;
+    let lag = oracle_info.lag;
+    let gr = (Decimal::from(5).sqrt().unwrap() - Decimal::ONE) / Decimal::TWO;
+    let gr_u256 = decimal_to_u256(gr, 18).ok()?;
+    let mut x1 = a + (b - a) * (U256::exp10(18) - gr_u256) / U256::exp10(18);
+    let mut x2 = a + (b - a) * gr_u256 / U256::exp10(18);
+    let mut f1 = get_profit_for_amount(&provider, path, x1, base_gas_price_wei, oracle_price, eth_price).await;
+    let mut f2 = get_profit_for_amount(&provider, path, x2, base_gas_price_wei, oracle_price, eth_price).await;
+    for _ in 0..15 {
+        if (b - a) <= tol { break; }
+        if f1 > f2 {
+            b = x2; x2 = x1; f2 = f1;
+            x1 = a + (b - a) * (U256::exp10(18) - gr_u256) / U256::exp10(18);
+            f1 = get_profit_for_amount(&provider, path, x1, base_gas_price_wei, oracle_price, eth_price).await;
+        } else {
+            a = x1; x1 = x2; f1 = f2;
+            x2 = a + (b - a) * gr_u256 / U256::exp10(18);
+            f2 = get_profit_for_amount(&provider, path, x2, base_gas_price_wei, oracle_price, eth_price).await;
         }
     }
-
-    Ok(None)
+    let optimal_amount = (a + b) / 2;
+    let net_profit_usd = f1.max(f2);
+    if net_profit_usd <= CONFIG.min_profit_usd { return None; }
+    let expected_output = path.simulate_v3_path(provider, optimal_amount).await.unwrap_or_default();
+    let path_key = path.key();
+    let mut stats_map = ROUTE_STATS.lock().unwrap();
+    let stats = stats_map.entry(path_key).or_default();
+    stats.last_attempt_block = current_block;
+    let total_fee_bps = (path.pool_1.fee + path.pool_2.fee + path.pool_3.fee) as f64;
+    let fee_efficiency = 1.0 / (1.0 + total_fee_bps / 10000.0);
+    let tvl_avg = (path.pool_1.tvl_usd + path.pool_2.tvl_usd + path.pool_3.tvl_usd) / 3.0;
+    let score = net_profit_usd * (1.0 + lag) * stats.winrate() * fee_efficiency * tvl_avg.log10().max(1.0);
+    path.score = score;
+    let gas_cost_usd_estimate = (eth_price * u256_to_decimal(base_gas_price_wei * CONFIG.gas_limit, 18).unwrap_or_default().to_f64().unwrap_or_default());
+    let gross_profit_usd = net_profit_usd + gas_cost_usd_estimate;
+    let bribe_usd = gross_profit_usd * CONFIG.max_bribe_percent;
+    Some(ArbitrageOpportunity {
+        path: path.clone(), optimal_amount_in: optimal_amount, expected_output, net_profit_usd,
+        bribe_usd, lag, tvl: tvl_avg, score, slippage_bps: 0,
+    })
 }
-
-pub async fn calculate_net_profit(
-    provider: Arc<Provider<Http>>,
-    amount_in: U256,
-    path: &ArbPath,
-    reserves: &HashMap<H160, Reserve>,
-) -> Result<(f64, U256), String> {
-    let amount_in_decimals = get_token_decimals(provider.clone(), path.token_a).await;
-
-    let (gross_profit_u256, expected_output) = match path.simulate_v2_path(amount_in, reserves) {
-        Some(amount_out) if amount_out > amount_in => (amount_out - amount_in, amount_out),
-        _ => return Ok((0.0, U256::zero())),
-    };
-
-    let gross_profit_dec = u256_to_decimal(&gross_profit_u256, amount_in_decimals);
-
-    let eth_price_usd = get_eth_price().await;
-    let token_price_usd = get_token_price_in_usd(provider.clone(), path.token_a).await?;
-    let gross_profit_usd = gross_profit_dec.to_f64().unwrap_or(0.0) * token_price_usd;
-    let gross_profit_eth = Decimal::from_f64(gross_profit_usd / eth_price_usd).unwrap_or(Decimal::ZERO);
-
-    let (max_fee_per_gas, _) = provider.estimate_eip1559_fees(None).await.map_err(|e| e.to_string())?;
-    let gas_price_eth = u256_to_decimal(&max_fee_per_gas, 18);
-    
-    let gas_used = dec!(250000); 
-    let gas_cost_eth = gas_used * gas_price_eth;
-
-    let bribe_percent = Decimal::from_f64(CONFIG.bribe_percent).unwrap_or(dec!(0)) / dec!(100);
-    let bribe_eth = gross_profit_eth * bribe_percent;
-
-    let total_cost_eth = gas_cost_eth + bribe_eth;
-    let net_profit_eth = gross_profit_eth - total_cost_eth;
-    let net_profit_usd = net_profit_eth.to_f64().unwrap_or(0.0) * eth_price_usd;
-
-    Ok((net_profit_usd, expected_output))
-}
-
-pub async fn get_token_price_in_usd(
-    provider: Arc<Provider<Http>>,
-    token: H160,
-) -> Result<f64, String> {
-    let weth: H160 = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2".parse().unwrap();
-    if token == weth {
-        return Ok(get_eth_price().await);
-    }
-    // ... Lógica para obtener precios de stablecoins y Chainlink ...
-    Ok(1.0) // Placeholder
-      }
-  
